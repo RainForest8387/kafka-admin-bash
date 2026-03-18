@@ -20,11 +20,11 @@ while IFS=':' read -r username password; do
 
   if [[ "$first_user" == true ]]; then
     echo "Создание файла и добавление пользователя: $username"
-    sudo htpasswd -b -B -c "$HTPASSWD_FILE" "$username" "$password" || exit 1
+    sudo htpasswd -b -m -c "$HTPASSWD_FILE" "$username" "$password" || exit 1
     first_user=false
   else
     echo "Добавление пользователя: $username"
-    sudo htpasswd -b -B "$HTPASSWD_FILE" "$username" "$password" || exit 1
+    sudo htpasswd -b -m "$HTPASSWD_FILE" "$username" "$password" || exit 1
   fi
 done < "$USERS_FILE"
 
