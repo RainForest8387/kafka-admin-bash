@@ -1,0 +1,3 @@
+admin:secretpass
+user1:mypassword
+user2:anotherpass
