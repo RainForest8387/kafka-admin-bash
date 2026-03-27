@@ -1,4 +1,4 @@
-# kafka-admin-bash
+# add-users
 
 ## Подготовка 
 Сохраните список пользователей в файл  users.txt  в формате  username:password  (один на строку), например:
