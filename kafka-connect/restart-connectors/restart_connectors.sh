@@ -1,18 +1,28 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -Eeuo pipefail
 
-HOST="http://$HOSTNAME:8084"
-MAX_WAIT=120
-SLEEP_STEP=2
+CONFIG_FILE="${CONFIG_FILE:-/etc/kafka-connect-restart.conf}"
 
-CONNECTORS=(
-  "TWCMS_NVBO_SOURCE"
-  "TWCMS_MCB_BO_SINK"
-)
+if [[ ! -r "$CONFIG_FILE" ]]; then
+  echo "[$(date '+%F %T')] Не найден конфиг: $CONFIG_FILE" >&2
+  exit 1
+fi
 
-LOG_DIR="/var/log/kafka-connect"
-LOG_FILE="$LOG_DIR/restart_connectors.log"
-LOCK_FILE="/tmp/restart-connectors.lock"
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
+
+: "${HOST:?HOST is required}"
+: "${MAX_WAIT:?MAX_WAIT is required}"
+: "${SLEEP_STEP:?SLEEP_STEP is required}"
+: "${LOG_DIR:?LOG_DIR is required}"
+: "${LOG_FILE:?LOG_FILE is required}"
+: "${LOCK_FILE:?LOCK_FILE is required}"
+
+if [[ ${#CONNECTORS[@]:-0} -eq 0 ]]; then
+  echo "[$(date '+%F %T')] В конфиге не задан список CONNECTORS" >&2
+  exit 1
+fi
+
 TMP_RESP="/tmp/restart-connectors-response.$$"
 
 mkdir -p "$LOG_DIR"
@@ -42,26 +52,74 @@ require_cmd() {
   }
 }
 
-api_code() {
-  local method="$1"
-  local url="$2"
-
-  curl -sS \
-    --connect-timeout 5 \
-    --max-time 30 \
-    -H 'Accept: application/json' \
-    -X "$method" \
-    -o "$TMP_RESP" \
-    -w '%{http_code}' \
-    "$url"
-}
-
 get_status() {
   curl -sS \
     --connect-timeout 5 \
     --max-time 30 \
     -H 'Accept: application/json' \
     "$HOST/connectors/$1/status"
+}
+
+is_running() {
+  local connector="$1"
+  local status
+  local connector_state
+  local failed
+
+  if ! status=$(get_status "$connector"); then
+    return 1
+  fi
+
+  connector_state=$(jq -r '.connector.state // "UNKNOWN"' <<<"$status")
+  failed=$(jq '[.tasks[]?.state, .connector.state] | map(select(. == "FAILED")) | length' <<<"$status")
+
+  [[ "$connector_state" == "RUNNING" && "$failed" -eq 0 ]]
+}
+
+api_with_retry() {
+  local method="$1"
+  local url="$2"
+  local retries="${3:-10}"
+  local delay="${4:-5}"
+
+  local attempt=1
+  local code
+
+  while (( attempt <= retries )); do
+    code=$(curl -sS \
+      --connect-timeout 5 \
+      --max-time 30 \
+      -H 'Accept: application/json' \
+      -X "$method" \
+      -o "$TMP_RESP" \
+      -w '%{http_code}' \
+      "$url") || {
+        log "Сетевая ошибка при $method $url, попытка $attempt/$retries"
+        sleep "$delay"
+        attempt=$((attempt + 1))
+        continue
+      }
+
+    case "$code" in
+      200|202|204)
+        return 0
+        ;;
+      409)
+        log "HTTP 409 для $method $url, вероятно идет rebalance, попытка $attempt/$retries"
+        [[ -s "$TMP_RESP" ]] && cat "$TMP_RESP"
+        sleep "$delay"
+        attempt=$((attempt + 1))
+        ;;
+      *)
+        log "HTTP $code для $method $url"
+        [[ -s "$TMP_RESP" ]] && cat "$TMP_RESP"
+        return 1
+        ;;
+    esac
+  done
+
+  log "Превышено число попыток для $method $url после HTTP 409/сетевых ошибок"
+  return 1
 }
 
 wait_until_paused() {
@@ -113,18 +171,13 @@ require_cmd jq
 require_cmd flock
 
 log "===== start ====="
+log "Используется конфиг: $CONFIG_FILE"
 
 for CONNECTOR in "${CONNECTORS[@]}"; do
   log "Коннектор: $CONNECTOR"
 
-  code=$(api_code PUT "$HOST/connectors/$CONNECTOR/pause") || {
-    log "$CONNECTOR: ошибка сети при pause"
-    continue
-  }
-
-  if [[ "$code" != "200" && "$code" != "202" && "$code" != "204" ]]; then
-    log "$CONNECTOR: pause вернул HTTP $code"
-    [[ -s "$TMP_RESP" ]] && cat "$TMP_RESP"
+  if ! api_with_retry PUT "$HOST/connectors/$CONNECTOR/pause" 12 5; then
+    log "$CONNECTOR: pause не выполнен"
     continue
   fi
 
@@ -133,29 +186,25 @@ for CONNECTOR in "${CONNECTORS[@]}"; do
     continue
   fi
 
-  code=$(api_code POST "$HOST/connectors/$CONNECTOR/restart?includeTasks=true&onlyFailed=false") || {
-    log "$CONNECTOR: ошибка сети при restart"
-    continue
-  }
-
-  if [[ "$code" != "200" && "$code" != "202" && "$code" != "204" ]]; then
-    log "$CONNECTOR: restart вернул HTTP $code"
-    [[ -s "$TMP_RESP" ]] && cat "$TMP_RESP"
-    continue
+  if ! api_with_retry POST "$HOST/connectors/$CONNECTOR/restart?includeTasks=true&onlyFailed=false" 12 5; then
+    if is_running "$CONNECTOR"; then
+      log "$CONNECTOR: restart вернул ошибки, но connector уже RUNNING без FAILED tasks"
+    else
+      log "$CONNECTOR: restart не выполнен"
+      continue
+    fi
   fi
 
   sleep 4
 
-  code=$(api_code PUT "$HOST/connectors/$CONNECTOR/resume") || {
-    log "$CONNECTOR: ошибка сети при resume"
-    continue
-  }
-
-  if [[ "$code" != "200" && "$code" != "202" && "$code" != "204" ]]; then
-    log "$CONNECTOR: resume вернул HTTP $code"
-    [[ -s "$TMP_RESP" ]] && cat "$TMP_RESP"
-    continue
-  }
+  if ! api_with_retry PUT "$HOST/connectors/$CONNECTOR/resume" 12 5; then
+    if is_running "$CONNECTOR"; then
+      log "$CONNECTOR: resume вернул ошибки, но connector уже RUNNING без FAILED tasks"
+    else
+      log "$CONNECTOR: resume не выполнен"
+      continue
+    fi
+  fi
 
   log "$CONNECTOR: итоговый статус"
   print_status "$CONNECTOR"
