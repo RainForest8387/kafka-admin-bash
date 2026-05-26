@@ -1,28 +1,20 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -Eeuo pipefail
 
-CONFIG_FILE="${CONFIG_FILE:-/etc/kafka-connect-restart.conf}"
+HOST="http://$HOSTNAME:8084"
+MAX_WAIT=120
+SLEEP_STEP=2
+RETRY_COUNT=12
+RETRY_DELAY=5
 
-if [[ ! -r "$CONFIG_FILE" ]]; then
-  echo "[$(date '+%F %T')] Не найден конфиг: $CONFIG_FILE" >&2
-  exit 1
-fi
+CONNECTORS=(
+  "TWCMS_NVBO_SOURCE"
+  "TWCMS_MCB_BO_SINK"
+)
 
-# shellcheck disable=SC1090
-source "$CONFIG_FILE"
-
-: "${HOST:?HOST is required}"
-: "${MAX_WAIT:?MAX_WAIT is required}"
-: "${SLEEP_STEP:?SLEEP_STEP is required}"
-: "${LOG_DIR:?LOG_DIR is required}"
-: "${LOG_FILE:?LOG_FILE is required}"
-: "${LOCK_FILE:?LOCK_FILE is required}"
-
-if [[ ${#CONNECTORS[@]:-0} -eq 0 ]]; then
-  echo "[$(date '+%F %T')] В конфиге не задан список CONNECTORS" >&2
-  exit 1
-fi
-
+LOG_DIR="/var/log/kafka-connect"
+LOG_FILE="$LOG_DIR/restart_connectors.log"
+LOCK_FILE="/tmp/restart-connectors.lock"
 TMP_RESP="/tmp/restart-connectors-response.$$"
 
 mkdir -p "$LOG_DIR"
@@ -65,6 +57,7 @@ is_running() {
   local status
   local connector_state
   local failed
+  local not_running
 
   if ! status=$(get_status "$connector"); then
     return 1
@@ -72,15 +65,16 @@ is_running() {
 
   connector_state=$(jq -r '.connector.state // "UNKNOWN"' <<<"$status")
   failed=$(jq '[.tasks[]?.state, .connector.state] | map(select(. == "FAILED")) | length' <<<"$status")
+  not_running=$(jq '[.tasks[]?.state] | map(select(. != "RUNNING")) | length' <<<"$status")
 
-  [[ "$connector_state" == "RUNNING" && "$failed" -eq 0 ]]
+  [[ "$connector_state" == "RUNNING" && "$failed" -eq 0 && "$not_running" -eq 0 ]]
 }
 
 api_with_retry() {
   local method="$1"
   local url="$2"
-  local retries="${3:-10}"
-  local delay="${4:-5}"
+  local retries="${3:-$RETRY_COUNT}"
+  local delay="${4:-$RETRY_DELAY}"
 
   local attempt=1
   local code
@@ -129,7 +123,7 @@ wait_until_paused() {
 
   while (( elapsed <= MAX_WAIT )); do
     if ! status=$(get_status "$connector"); then
-      log "$connector: не удалось получить status при ожидании pause"
+      log "$connector: не удалось получить статус при ожидании PAUSED"
       return 1
     fi
 
@@ -138,7 +132,7 @@ wait_until_paused() {
     restarting=$(jq '[.connector.state, (.tasks[]?.state)] | map(select(. == "RESTARTING")) | length' <<<"$status")
 
     if [[ "$connector_state" == "PAUSED" && "$running" -eq 0 && "$restarting" -eq 0 ]]; then
-      log "$connector: pause завершен"
+      log "$connector: PAUSED завершен"
       return 0
     fi
 
@@ -150,12 +144,40 @@ wait_until_paused() {
   return 1
 }
 
+wait_until_running() {
+  local connector="$1"
+  local elapsed=0
+  local status connector_state failed not_running
+
+  while (( elapsed <= MAX_WAIT )); do
+    if ! status=$(get_status "$connector"); then
+      log "$connector: не удалось получить статус при ожидании RUNNING"
+      return 1
+    fi
+
+    connector_state=$(jq -r '.connector.state // "UNKNOWN"' <<<"$status")
+    failed=$(jq '[.tasks[]?.state, .connector.state] | map(select(. == "FAILED")) | length' <<<"$status")
+    not_running=$(jq '[.tasks[]?.state] | map(select(. != "RUNNING")) | length' <<<"$status")
+
+    if [[ "$connector_state" == "RUNNING" && "$failed" -eq 0 && "$not_running" -eq 0 ]]; then
+      log "$connector: connector и все tasks в состоянии RUNNING"
+      return 0
+    fi
+
+    sleep "$SLEEP_STEP"
+    elapsed=$((elapsed + SLEEP_STEP))
+  done
+
+  log "$connector: timeout ожидания RUNNING (${MAX_WAIT} сек)"
+  return 1
+}
+
 print_status() {
   local connector="$1"
   local status
 
   if ! status=$(get_status "$connector"); then
-    log "$connector: не удалось получить итоговый status"
+    log "$connector: не удалось получить итоговый статус"
     return 1
   fi
 
@@ -171,12 +193,11 @@ require_cmd jq
 require_cmd flock
 
 log "===== start ====="
-log "Используется конфиг: $CONFIG_FILE"
 
 for CONNECTOR in "${CONNECTORS[@]}"; do
   log "Коннектор: $CONNECTOR"
 
-  if ! api_with_retry PUT "$HOST/connectors/$CONNECTOR/pause" 12 5; then
+  if ! api_with_retry PUT "$HOST/connectors/$CONNECTOR/pause"; then
     log "$CONNECTOR: pause не выполнен"
     continue
   fi
@@ -186,9 +207,9 @@ for CONNECTOR in "${CONNECTORS[@]}"; do
     continue
   fi
 
-  if ! api_with_retry POST "$HOST/connectors/$CONNECTOR/restart?includeTasks=true&onlyFailed=false" 12 5; then
+  if ! api_with_retry POST "$HOST/connectors/$CONNECTOR/restart?includeTasks=true&onlyFailed=false"; then
     if is_running "$CONNECTOR"; then
-      log "$CONNECTOR: restart вернул ошибки, но connector уже RUNNING без FAILED tasks"
+      log "$CONNECTOR: restart вернул ошибки, но connector уже RUNNING без FAILED/non-RUNNING tasks"
     else
       log "$CONNECTOR: restart не выполнен"
       continue
@@ -197,13 +218,17 @@ for CONNECTOR in "${CONNECTORS[@]}"; do
 
   sleep 4
 
-  if ! api_with_retry PUT "$HOST/connectors/$CONNECTOR/resume" 12 5; then
+  if ! api_with_retry PUT "$HOST/connectors/$CONNECTOR/resume"; then
     if is_running "$CONNECTOR"; then
-      log "$CONNECTOR: resume вернул ошибки, но connector уже RUNNING без FAILED tasks"
+      log "$CONNECTOR: resume вернул ошибки, но connector уже RUNNING без FAILED/non-RUNNING tasks"
     else
       log "$CONNECTOR: resume не выполнен"
       continue
     fi
+  fi
+
+  if ! wait_until_running "$CONNECTOR"; then
+    log "$CONNECTOR: после resume connector не перешел в RUNNING вовремя"
   fi
 
   log "$CONNECTOR: итоговый статус"
