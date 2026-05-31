@@ -99,3 +99,109 @@ GC-паузы — объясняют и 36-секундные провалы, и
 ISR shrink + acks=all у producer — реплики не успевают, consumer ждёт
 Перегруженный leader — скос партиций, весь трафик через один брокер
 Сетевая конкуренция — репликация и consumer на одной полосе
+
+
+Если через 2-3 дня p99 не снизится, значит есть хроническая проблема помимо heap. С учётом всего что мы уже знаем о кластере, вот полный план действий.
+#### Шаг 1 — Локализовать проблему точнее
+Первым делом нужно понять: это все produce-запросы медленные или конкретные топики/партиции.
+
+```bash
+# Латентность по типам запросов — сравниваем Produce vs Fetch vs Metadata
+kafka-run-class.sh kafka.tools.JmxTool \
+  --jmx-url service:jmx:rmi:///jndi/rmi://localhost:9999/jmxrmi \
+  --object-name "kafka.network:type=RequestMetrics,name=TotalTimeMs,request=Produce" \
+  --attributes "99thPercentile,Mean" \
+  --reporting-interval 10000 2>/dev/null &
+
+kafka-run-class.sh kafka.tools.JmxTool \
+  --jmx-url service:jmx:rmi:///jndi/rmi://localhost:9999/jmxrmi \
+  --object-name "kafka.network:type=RequestMetrics,name=TotalTimeMs,request=FetchConsumer" \
+  --attributes "99thPercentile,Mean" \
+  --reporting-interval 10000 2>/dev/null &
+
+# Декомпозиция времени produce-запроса
+# RemoteTimeMs = время ожидания репликации (acks=all)
+# LocalTimeMs  = время локальной записи
+# ResponseQueueTimeMs = время в очереди ответов
+# RequestQueueTimeMs  = время ожидания в очереди запросов
+for metric in RemoteTimeMs LocalTimeMs ResponseQueueTimeMs RequestQueueTimeMs; do
+  echo "=== $metric ==="
+  kafka-run-class.sh kafka.tools.JmxTool \
+    --jmx-url service:jmx:rmi:///jndi/rmi://localhost:9999/jmxrmi \
+    --object-name "kafka.network:type=RequestMetrics,name=${metric},request=Produce" \
+    --attributes "99thPercentile" \
+    --one-time true 2>/dev/null
+done
+```
+
+Эта декомпозиция сразу покажет где именно теряется время:
+Метрика высокая | Причина |
+|---|---|---|
+RequestQueueTimeMs | Перегружены network threads | 
+LocalTimeMs | Проблема с диском или fsync | 
+RemoteTimeMs |Репликация медленная, ждём ISR |
+ResponseQueueTimeMs | Перегружены io threads |
+
+#### Шаг 2 — Насыщение сетевых потоков
+При 1396 партициях и num.network.threads=3 — это первый кандидат на узкое место
+```bash
+# NetworkProcessorAvgIdlePercent — если < 0.3, network threads перегружены
+kafka-run-class.sh kafka.tools.JmxTool \
+  --jmx-url service:jmx:rmi:///jndi/rmi://localhost:9999/jmxrmi \
+  --object-name "kafka.network:type=SocketServer,name=NetworkProcessorAvgIdlePercent" \
+  --attributes "Value" \
+  --reporting-interval 5000 2>/dev/null | head -20
+
+# RequestHandlerAvgIdlePercent — если < 0.3, io threads перегружены
+kafka-run-class.sh kafka.tools.JmxTool \
+  --jmx-url service:jmx:rmi:///jndi/rmi://localhost:9999/jmxrmi \
+  --object-name "kafka.server:type=KafkaRequestHandlerPool,name=RequestHandlerAvgIdlePercent" \
+  --attributes "OneMinuteRate" \
+  --reporting-interval 5000 2>/dev/null | head -20
+
+# Размер очереди запросов — если растёт, брокер не справляется
+kafka-run-class.sh kafka.tools.JmxTool \
+  --jmx-url service:jmx:rmi:///jndi/rmi://localhost:9999/jmxrmi \
+  --object-name "kafka.network:type=RequestChannel,name=RequestQueueSize" \
+  --attributes "Value" \
+  --reporting-interval 5000 2>/dev/null | head -20
+```
+
+Если `NetworkProcessorAvgIdlePercent < 0.3` — увеличиваем в server.properties:
+
+```bash
+# Было: num.network.threads=3
+# Стало для 16 ядер и 1396 партиций:
+num.network.threads=6
+num.io.threads=12
+```
+
+
+#### Шаг 6 — OS-тюнинг
+```bash
+# Сетевые буферы — при высоком throughput маленькие буферы дают латентность
+sysctl net.core.rmem_max net.core.wmem_max \
+       net.core.rmem_default net.core.wmem_default \
+       net.ipv4.tcp_rmem net.ipv4.tcp_wmem
+
+# Рекомендуемые значения для Kafka
+cat >> /etc/sysctl.conf << 'EOF'
+net.core.rmem_max=134217728
+net.core.wmem_max=134217728
+net.core.rmem_default=65536
+net.core.wmem_default=65536
+net.ipv4.tcp_rmem=4096 65536 134217728
+net.ipv4.tcp_wmem=4096 65536 134217728
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_mtu_probing=1
+EOF
+sysctl -p
+
+# Лимиты файловых дескрипторов
+ulimit -n
+cat /proc/$(pgrep -f kafka)/limits | grep "open files"
+# Должно быть не менее 100000
+# Если меньше — добавляем в /etc/security/limits.conf:
+# kafka soft nofile 100000
+# kafka hard nofile 100000
+```
