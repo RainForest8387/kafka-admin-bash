@@ -45,3 +45,38 @@ else
     exit 1
 fi
 ```
+
+`log.sh`
+```bash
+#!/bin/bash
+
+NAME="einfahrt"
+
+echo "Check for container presence, gathering log"
+if [ ! -z "$(docker ps -a | awk '{print $NF}' | grep "^${NAME}$")" ]; then
+    echo -e "Press Ctrl-C to stop log output\n\n"
+    
+    
+    docker logs ${NAME} -f --tail=10 --timestamps 2>&1 | awk '
+    {
+        if ($1 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}T/) {
+            match($1, /^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})/, timepart)
+            spec = timepart[1] " " timepart[2] " " timepart[3] " " timepart[4] " " timepart[5] " " timepart[6]
+            
+            # Конвертируем UTC в Unix-timestamp и добавляем 3 часа (10800 секунд) для формата Europe/Moscow
+            moscow_timestamp = mktime(spec) + 10800
+            local_time = strftime("[%Y-%m-%d %H:%M:%S]", moscow_timestamp)
+            
+            sub(/^[^ ]+ /, "")
+            print local_time " " $0
+        } else {
+            print $0
+        }
+        fflush()
+    }'
+else
+    echo "ERROR: No container process found"
+    exit 1
+fi
+
+```
