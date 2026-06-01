@@ -11,7 +11,7 @@ LOGFILE="log-$(date +%Y%m%d-%H%M%S).txt"
 echo "Check for container presence, gathering log"
 if [ ! -z "$(docker ps -a | awk '{print $NF}' | grep "^${NAME}$")" ]; then
     
-    echo "Processing logs with high-speed AWK parser..."
+    echo "Processing logs ..."
 
     docker logs ${NAME} --timestamps 2>&1 | awk '
     {
