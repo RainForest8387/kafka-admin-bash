@@ -101,31 +101,39 @@ if [ ! -z "$(docker ps -a | awk '{print $NF}' | grep "^${NAME}$")" ]; then
         RESET = "\033[0m"
     }
     {
-        # 1. Обрабатываем время (перевод из UTC в MSK)
+        # 1. Обрабатываем время (перевод из UTC в  MSK) через универсальный split
         if ($1 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}T/) {
-            match($1, /^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})/, timepart)
-            spec = timepart " " timepart " " timepart " " timepart " " timepart " " timepart
+            
+            # Вырезаем только часть с датой и временем: "YYYY-MM-DD-HH-MM-SS"
+            # Заменяем T, кластеры двоеточий и дефисов на единый разделитель "-"
+            clean_dt = substr($1, 1, 19)
+            gsub(/[T:]/, "-", clean_dt)
+            
+            # Разбиваем строку в массив timepart (1=ГГГГ, 2=ММ, 3=ДД, 4=ЧЧ, 5=ММ, 6=СС)
+            split(clean_dt, timepart, "-")
+            
+            # Формируем строку для mktime (формат: "YYYY MM DD HH MM SS")
+            spec = timepart[1] " " timepart[2] " " timepart[3] " " timepart[4] " " timepart[5] " " timepart[6]
             
             moscow_timestamp = mktime(spec) + 10800
             
-            # Форматируем время без скобок, добавляя подсвеченный текст "MSK"
+            # Форматируем время, добавляя подсвеченный текст "MSK"
             local_time = GREY strftime("%Y-%m-%d %H:%M:%S", moscow_timestamp) " MSK" RESET
             
-            # Удаляем исходный UTC штамп Docker из начала строки
+            # Удаляем исходный UTC из начала строки
             sub(/^[^ ]+ /, "")
             line = local_time " " $0
         } else {
             line = $0
         }
 
-        # 2. Выделение уровней логов цветом
-        IGNORECASE = 1
-        if (line ~ /ERROR/) {
-            sub(/ERROR/, RED "&" RESET, line)
-        } else if (line ~ /WARN(ING)?/) {
-            sub(/WARN(ING)?/, YEL "&" RESET, line)
-        } else if (line ~ /INFO/) {
-            sub(/INFO/, GRN "&" RESET, line)
+        # 2. Раскрашиваем уровни логов Java приложения
+        if (line ~ /[Ee][Rr][Rr][Oo][Rr]/) {
+            sub(/[Ee][Rr][Rr][Oo][Rr]/, RED "&" RESET, line)
+        } else if (line ~ /[Ww][Aa][Rr][Nn]/) {
+            sub(/[Ww][Aa][Rr][Nn]/, YEL "&" RESET, line)
+        } else if (line ~ /[Ii][Nn][Ff][Oo]/) {
+            sub(/[Ii][Nn][Ff][Oo]/, GRN "&" RESET, line)
         }
 
         print line
